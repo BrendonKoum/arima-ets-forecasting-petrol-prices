@@ -1,0 +1,429 @@
+### - DYNAMIC REGRESSION - ###
+
+# wrangle data for 1) exchange rate predictor 
+
+# match dates of exchange rates dates with petrol price dates 
+
+library(readxl)
+exchange_rates <- read_excel("exchange.rates.xlsx")
+View(exchange_rates)
+
+exchange_rates %>%
+  mutate(date = as_date(date)) %>%
+  as_tsibble(index = date) -> fx.ts
+
+tsibble::fill_gaps(fx.ts) -> fx.ts.filled
+as.data.frame(fx.ts.filled) -> x
+
+x %>%
+  slice(1:(n()-42)) -> y
+
+
+y$date = NULL
+
+# ASSUMPTION: because major institutions won't be trading over the weekend
+# trade volume is low - therefore less fluctuations over the weekend
+# THEREFORE, I will simply take the averages between Friday and Monday and impute mean
+
+library(zoo)
+
+0.5*(na.locf(y,fromlast=TRUE) + na.locf(y)) -> imp.rate
+
+imp.rate -> b
+
+b %>%
+  mutate(Date=seq(ymd("2017-09-04"),by="days",length.out=1458), .before=rate) %>%
+  as_tsibble(index = Date) -> fx.rate
+
+# wrangle data for 2) tgp price (wholesale price)
+
+library(readxl)
+daily_tgp_price <- read_excel("daily.tgp.price.xlsx", 
+                              sheet = "Petrol TGP")
+View(daily_tgp_price)
+colnames(daily_tgp_price)[1]
+
+daily_tgp_price
+
+daily_tgp_price %>% 
+  select("AVERAGE ULP TGPS\r\n(inclusive of GST)", "Sydney") %>%
+  rename(date = "AVERAGE ULP TGPS\r\n(inclusive of GST)", cpl = "Sydney") %>%
+  mutate(date = as_date(date)) %>% 
+  as_tsibble(index = date) %>% 
+  slice(3568:4609) -> unfilled.tgp
+
+tsibble::fill_gaps(unfilled.tgp) -> tgp
+
+tgp$date = NULL
+ 
+0.5*(na.locf(tgp,fromlast=TRUE) + na.locf(tgp)) -> imp.tgp
+
+imp.tgp %>%
+  mutate(Date=seq(ymd("2017-09-04"),by="days",length.out=1458), .before=cpl) %>%
+  as_tsibble(index = Date) -> tgp.price
+tgp.price
+
+# defining regressors and dependent variables 
+
+tgp.price -> x1
+
+fx.rate -> x2
+
+interp.ts -> y
+
+ARIMA(y ~ x1 + x2)
+
+x1 %>% autoplot
+x2 %>% autoplot
+y %>% autoplot
+
+# Convert daily retail price to daily percentage change 
+
+y %>%
+  mutate(diff_cpl = difference(cpl)) %>%
+  slice(2:n()) %>%
+  select(Date, diff_cpl) -> ts1
+
+y %>%
+  slice(1:n()-1) %>%
+  mutate(Date=seq(ymd("2017-09-05"),by="days",length.out=1457), .before=cpl) -> ts2
+
+merge(ts1,ts2) %>%
+  as_tsibble() %>%
+  mutate(pct_change = (diff_cpl/cpl)*100) %>%
+  select(Date, pct_change) -> delta.y
+  
+delta.y %>% 
+  autoplot()
+
+# convert daily tgp price to daily percentage change 
+
+x1 %>%
+  mutate(diff_cpl = difference(cpl)) %>%
+  slice(2:n()) %>%
+  select(Date, diff_cpl) -> ts3
+
+x1 %>%
+  slice(1:n()-1) %>%
+  mutate(Date=seq(ymd("2017-09-05"),by="days",length.out=1457), .before=cpl) -> ts4
+
+merge(ts3,ts4) %>%
+  as_tsibble() %>%
+  mutate(pct_change = (diff_cpl/cpl)*100) %>%
+  select(Date, pct_change) -> delta.x1
+
+delta.x1 %>%
+  autoplot()
+
+# convert daily fx rate to daily percentage change 
+
+x2 %>%
+  mutate(diff_rate = difference(rate)) %>%
+  slice(2:n()) %>%
+  select(Date, diff_rate) -> ts5
+
+x2 %>%
+  slice(1:n()-1) %>%
+  mutate(Date=seq(ymd("2017-09-05"),by="days",length.out=1457), .before=rate) -> ts6
+
+merge(ts5,ts6) %>%
+  as_tsibble() %>%
+  mutate(pct_change = (diff_rate/rate)*100) %>%
+  select(Date, pct_change) -> delta.x2
+
+delta.x2 %>%
+  autoplot()
+
+# regression time
+
+merge(x=delta.x1,y=delta.x2,by="Date",all=TRUE) -> df
+
+merge(x=df,y=delta.y,by="Date",all=TRUE) %>%
+  as_tsibble(index = Date) %>%
+  rename(TGP = pct_change.x, FX = pct_change.y, Retail = pct_change) -> delta.variables
+
+library(GGally)
+
+delta.variables %>%
+  GGally::ggpairs(columns = 2:4)
+
+# inspect how many days before the tgp lines up with retail? 
+
+delta.variables %>%
+  pivot_longer(-Date) %>%
+  ggplot(aes(Date, value, color = name)) +
+  geom_line() +
+  facet_grid(name ~ ., scales = "free_y") +
+  guides(colour = "none") +
+  labs(y="% change")
+
+delta.variables %>%
+  model(lm = TSLM(Retail ~ trend() + season()),
+        mlr = TSLM(Retail ~ TGP + FX),
+        TGP = TSLM(Retail ~ TGP),
+        FX = TSLM(Retail ~ FX),
+        ARIMA = ARIMA(Retail ~ TGP + FX)) -> fit
+
+glance(fit)
+
+# regress lags of up to 14 days - two weeks
+
+insurance %>%
+  mutate(Quotes = c(NA, NA, NA, Quotes[4:40])) %>%
+  model(
+    lag0 = ARIMA(Quotes ~ pdq(d = 0) + TVadverts),
+    lag1 = ARIMA(Quotes ~ pdq(d = 0) +
+                   TVadverts + lag(TVadverts)),
+    lag2 = ARIMA(Quotes ~ pdq(d = 0) +
+                   TVadverts + lag(TVadverts) +
+                   lag(TVadverts, 2)),
+    lag3 = ARIMA(Quotes ~ pdq(d = 0) +
+                   TVadverts + lag(TVadverts) +
+                   lag(TVadverts, 2) + lag(TVadverts, 3)))
+
+delta.variables %>%
+  mutate(Retail = c(NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA, Retail[15:1457])) %>%
+  model(
+    lag0.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX, stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.0 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.1 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+
+    lag0.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.2 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.3 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.4 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.5 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.6 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.7 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2)  + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.8 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.9 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.10 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+   
+    lag0.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.11 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.12 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    
+    lag0.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.13 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+   
+    lag0.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag1.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag2.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag3.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag4.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag5.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag6.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag7.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag8.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag9.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag10.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag11.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag12.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag13.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+    lag14.14 = ARIMA(Retail ~ pdq(d = 0) + TGP + FX + lag(TGP) + lag(TGP,2) + lag(TGP,3) + lag(TGP,4) + lag(TGP,5) + lag(TGP,6) + lag(TGP,7) + lag(TGP,8) + lag(TGP,9) + lag(TGP,10) + lag(TGP,11) + lag(TGP,12) + lag(TGP,13) + lag(TGP,14) + lag(FX) + lag(FX,2) + lag(FX,3) + lag(FX,4) + lag(FX,5) + lag(FX,6) + lag(FX,7) + lag(FX,8) + lag(FX,9) + lag(FX,10) + lag(FX,11) + lag(FX,12) + lag(FX,13) + lag(FX,14), stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+     ) -> fit
+
+glance(fit) %>%
+  arrange(AICc) -> check
