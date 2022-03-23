@@ -1,0 +1,144 @@
+### - Exploratory Data Analysis - ###
+
+
+# plot tsibble
+
+interp.ts %>%
+  autoplot()
+
+# check daily seasonality + monthly seasonality - none detected
+
+ts.filled %>% 
+  gg_subseries(cpl,
+               period = "week", labels = "both")
+
+ts.filled %>% 
+  gg_subseries(cpl,
+               period = 31, labels = "both")
+
+ts.filled %>%
+  gg_season(cpl, period = "week")
+
+ts.filled %>%
+  gg_season(cpl, period = "year")
+
+### - SPECIFY MODEL (ARIMA) - ###
+
+# fit ARIMA model using 80% training data
+
+interp.ts %>%
+  slice(1:(n()-292)) -> training.data
+
+training.data %>%
+  autoplot()
+
+# manual selection of ARIMA model
+
+training.data %>%
+  gg_tsdisplay()
+
+training.data %>%
+  features(cpl,unitroot_kpss)
+
+training.data %>%
+  mutate(diff_cpl = difference(cpl)) -> differenced.data
+
+differenced.data %>%
+  features(diff_cpl,unitroot_kpss)
+
+# therefore dth order = 1, now determine p and q order by looking at acf/pacf plot
+
+differenced.data %>%
+  select(Date, diff_cpl) %>%
+  gg_tsdisplay(plot_type = "partial")
+
+# sinusoidal acf plot + signifiant spike at lag 1 in pacf plot, thus p = 1 
+  
+training.data %>%
+  model(arimaAUTO = ARIMA(cpl, greedy = FALSE, approximation = FALSE, stepwise = FALSE),
+        arima110 = ARIMA(cpl ~ pdq(1,1,0) + PDQ(0,0,0)),
+        arima110xxx = ARIMA(cpl ~ pdq(1,1,0))) -> arima.fit
+
+# check residuals of fit 
+
+tidy(arima.fit)
+
+arima.fit %>%
+  select(arimaAUTO) %>%
+  gg_tsresiduals()
+
+arima.fit %>%
+  select(arima110) %>%
+  gg_tsresiduals()
+
+arima.fit %>%
+  select(arima110xxx) %>%
+  gg_tsresiduals()
+
+augment(arima.fit) %>%
+  features(.innov, ljung_box, lag = 10, dof = 6)
+
+# select arimaAUTO since there is still information in residuals for other models 
+
+# forecast using arimaAUTO
+
+arima.fit %>% 
+  select(arimaAUTO) %>%
+  forecast(h=292) -> arima.fc
+
+arima.fc %>%
+  autoplot() + autolayer(interp.ts)
+
+# note: forecasts were too reliant on the interpolated data vs actual data
+# so. will opt for removing only last 31 days for training data
+
+# estimate ARIMA - train ARIMA using all but last 31 observations
+
+interp.ts %>%
+  slice(1:(n()-31)) -> training.data2
+
+
+training.data2 %>% 
+  model(arimaAUTO = ARIMA(cpl, stepwise = FALSE, greedy = FALSE, approximation = FALSE),
+        arima110xxx = ARIMA(cpl ~ pdq(1,1,0)),
+        arima110 = ARIMA(cpl ~ pdq(1,1,0) + PDQ(0,0,0))) -> arima.fit2
+
+# check residuals
+
+tidy(arima.fit2)
+
+arima.fit2 %>%
+  select(arimaAUTO) %>%
+  gg_tsresiduals()
+
+arima.fit2 %>%
+  select(arima110) %>%
+  gg_tsresiduals()
+
+arima.fit2 %>%
+  select(arima110xxx) %>%
+  gg_tsresiduals()
+
+augment(arima.fit2) %>%
+  features(.innov, ljung_box, lag = 10, dof = 6)
+
+# only the errors of arimaAUTO resemble white noise, therefore fc only with arimaAUTO
+
+arima.fit2 %>%
+  select(arimaAUTO) %>%
+  forecast(h=31) -> arima.fc2
+
+arima.fc2 %>%
+  autoplot() + autolayer(interp.ts)
+
+# plot close-up 
+
+interp.ts %>%
+  slice(1428:1458) -> recent.data
+
+arima.fc2 %>%
+  autoplot() + autolayer(recent.data)
+
+# compute ARIMA accuracy 
+
+accuracy(arima.fc2, recent.data) -> accuracy.arima
