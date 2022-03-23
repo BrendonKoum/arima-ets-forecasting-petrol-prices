@@ -1,0 +1,133 @@
+### - SPECIFY MODEL (ETS) - ###
+
+
+
+# Estimate ETS - train ETS models using 80% of data
+
+interp.ts %>%
+  slice(1:(n()-292)) -> training.data
+
+training.data %>%
+  autoplot()
+
+training.data %>%
+  model(etsMNN = ETS(cpl ~ error("M") + trend("N") + season("N")),
+        etsANN = ETS(cpl ~ error("A") + trend("N") + season("N")),
+        etsAUTO = ETS(cpl)) -> ets.fit
+
+ets.fit %>%
+  forecast(h=292) %>% 
+  autoplot() + autolayer(interp.ts)
+
+# similar issue as before, most recent data is too close to the missing values
+
+# Estimate ETS - train ETS models using all but last 31 days of total data 
+
+interp.ts %>%
+  slice(1:(n()-31)) -> training.data2
+
+# for some reason, below code doesn't show etsANN
+
+training.data2 %>%
+  model(etsMNN = ETS(cpl ~ error("M") + trend("N") + season("N")),
+        etsANN = ETS(cpl ~ error("A") + trend("N") + season("N")),
+        etsAUTO = ETS(cpl)) -> ets.fit2
+
+ets.fit2 %>%
+  forecast(h=31) %>%
+  autoplot() + autolayer(recent.data)
+
+# separate etsANN model and will autolayer it at the end
+
+training.data2 %>%
+  model(etsANN = ETS(cpl ~ error("A") + trend("N") + season("N"))) -> etsANN.fit
+
+training.data2 %>%
+  model(etsMNN = ETS(cpl ~ error("M") + trend("N") + season("N")),
+        etsAUTO = ETS(cpl)) -> etsMNN.etsAUTO.fit
+
+etsMNN.etsAUTO.fit %>%
+  forecast(h=31) -> etsMNN.etsAUTO.fc
+
+etsANN.fit %>%
+  forecast(h=31) -> etsANN.fc
+
+# combine etsANN fc with other ets models
+# etsANN is shown in dark blue with smaller prediction interval in below code
+
+etsMNN.etsAUTO.fc %>%
+  autoplot() + autolayer(etsANN.fc) + autolayer(recent.data)
+
+# accuracy of ets
+
+accuracy(etsMNN.etsAUTO.fc, recent.data) -> accuracy.etsMNN.ets.AUTO
+
+accuracy(etsANN.fc, recent.data) -> accuracy.ets.ANN 
+
+accuracy.etsMNN.ets.AUTO
+accuracy.ets.ANN
+
+# simple forecasting methods - baseline comparisons
+
+simple.fit <- training.data2 %>%
+  model(
+    Mean = MEAN(cpl),
+    `Naïve` = NAIVE(cpl),
+    `Seasonal naïve` = SNAIVE(cpl),
+    Drift = RW(cpl ~ drift())
+  )
+
+simple.fit %>%
+  forecast(h=31) -> simple.fc
+
+simple.fc %>% 
+  autoplot(level=NULL) + autolayer(recent.data)
+
+
+accuracy(simple.fc,recent.data) -> accuracy.simple
+
+# compare plots of ETS, ARIMA and simple forecasts
+
+etsMNN.etsAUTO.fc %>%
+  autoplot(level = NULL) + 
+  autolayer(etsANN.fc, level = NULL) + 
+  autolayer(simple.fc, level = NULL) +
+  autolayer(arima.fc2, level = NULL) +
+  autolayer(recent.data)
+
+# above plot for some reason doesn't show arimaAUTO, so will plot separately
+
+arima.fc2 %>%
+  autoplot() + autolayer(recent.data)
+
+
+# compare accuracy of ETS, ARIMA and simple forecasts
+
+accuracy.arima
+accuracy.etsMNN.ets.AUTO
+accuracy.ets.ANN
+accuracy.simple
+
+# since ETS, ARIMA and NAIVE are top 4 models - examine closely 
+
+naive.fit <- training.data2 %>%
+  model(`Naïve` = NAIVE(cpl))
+
+naive.fit %>%
+  forecast(h=31) -> naive.fc
+
+training.data2 %>%
+  model(etsMNN = ETS(cpl ~ error("M") + trend("N") + season("N")),
+        etsANN = ETS(cpl ~ error("A") + trend("N") + season("N"))) -> ets.fit3
+
+ets.fit3 %>%
+  forecast(h=31) -> ets.fc3
+
+naive.fc %>%
+  autoplot() + autolayer(recent.data)
+
+ets.fc3 %>%
+  autoplot() + autolayer(recent.data)
+
+arima.fc2 %>%
+  autoplot() + autolayer(recent.data)
