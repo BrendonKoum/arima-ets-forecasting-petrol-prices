@@ -1,0 +1,52 @@
+library(fpp3)
+
+
+
+### - TIDY DATA - ###
+
+
+
+# read text file
+input <- readLines("petrol.txt")
+
+#insert line breaks
+input <- gsub("],[", "\n", input, fixed = TRUE)
+
+#remove "new Date"
+input <- gsub("new Date", "", input, fixed = TRUE)
+
+#remove parentheses and brackets
+input <- gsub("[\\(\\)\\[\\]]", "", input, perl = TRUE)
+
+#import cleaned data
+DF <- read.csv(text = input, header = FALSE, quote = "'")
+DF$V1 <- as.Date(DF$V1)
+print(DF)
+DF
+
+# Convert data to tsibble
+
+DF %>%
+  mutate(V1 = as_date(V1)) %>%
+  as_tsibble(index = V1) %>%
+  select(V1, V2) %>%
+  rename(Date = V1, cpl = V2) -> ts
+
+# fill in missing dates for tsibble and plot 
+
+tsibble::fill_gaps(ts) -> ts.filled
+
+ts.filled %>%
+  autoplot()
+
+# interpolate missing cpl values using ARIMA
+
+ts.filled %>%
+  model(ARIMA(cpl,
+              greedy = FALSE,
+              approximation = FALSE,
+              stepwise = FALSE)) -> auto.arima
+
+auto.arima %>%
+  interpolate(ts.filled) -> interp.ts
+
