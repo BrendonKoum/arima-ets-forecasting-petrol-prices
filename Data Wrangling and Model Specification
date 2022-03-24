@@ -39,7 +39,7 @@ tsibble::fill_gaps(ts) -> ts.filled
 ts.filled %>%
   autoplot()
 
-# interpolate missing cpl values using ARIMA
+# interpolate missing cpl values using ARIMA 
 
 ts.filled %>%
   model(ARIMA(cpl,
