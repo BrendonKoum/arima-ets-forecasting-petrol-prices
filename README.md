@@ -5,4 +5,4 @@ The following time series model used to fit to the data were: NAIVE, ETS and ARI
 
 At the moment I am attempting to build a more technical model using regressors for a dynamic regression model. As mentioned by the ACCC in (https://www.accc.gov.au/consumers/petrol-diesel-lpg/about-fuel-prices#what-affects-fuel-prices-) potential regressors I have access to data include: 1) AU/US FX rates AND 2) Terminal Gas Prices (TGP). Currently, two additional regressors I am attempting to fit in the model will be 1) the lags of FX rates and 2) the lags of TGP. 
 
-NOTE: the fpp3 package will be required for the code to run 
+NOTE: the fpp3 package will be required for the code to run  
