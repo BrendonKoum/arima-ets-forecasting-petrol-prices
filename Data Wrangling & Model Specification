@@ -331,6 +331,6 @@ ets.fc3 %>%
   autoplot() + autolayer(recent.data)
 
 arima.fc2 %>%
-  autoplot() + autolayer(recent.data)
+  autoplot() + autolayer(recent.data) 
 
 
