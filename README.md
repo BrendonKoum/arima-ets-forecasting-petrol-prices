@@ -1,4 +1,4 @@
-# Why are petrol prices so damn expensive? 
+# Why are petrol prices so expensive? 
 During Sydney's second lockdown in 2020, retail fuel prices were soaring. Seeing as I was in lockdown and had a lot of spare time, I wanted to investigate and see whether I could build a model that could accurately describe and potentially forecast Sydney petrol prices to maximise fuel savings using R. 
 
 The following time series model used to fit to the data were: NAIVE, ETS and ARIMA models. I succeeded building all 3 models with the ARIMA model being the most accurate. 
